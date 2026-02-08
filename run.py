@@ -19,7 +19,7 @@ import torch
 import psutil
 
 from video_depth_anything.video_depth import VideoDepthAnything
-from utils.dc_utils import read_video_frames, save_video
+from utils.dc_utils import get_video_info, save_video
 
 def log_memory(stage: str):
     proc = psutil.Process(os.getpid())
@@ -63,26 +63,26 @@ if __name__ == '__main__':
     video_depth_anything = video_depth_anything.to(DEVICE).eval()
     log_memory('model loaded')
 
-    frames, target_fps = read_video_frames(args.input_video, args.max_len, args.target_fps, args.max_res)
-    log_memory(f'video decoded — frames.shape={frames.shape}, dtype={frames.dtype}, size={frames.nbytes / (1024**3):.2f} GB')
-    depths, fps = video_depth_anything.infer_video_depth(frames, target_fps, input_size=args.input_size, device=DEVICE, fp32=args.fp32)
-    log_memory(f'inference done — depths.shape={depths.shape}, dtype={depths.dtype}, size={depths.nbytes / (1024**3):.2f} GB')
-
-    # Free model to reclaim GPU and CPU memory before saving
-    del video_depth_anything
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
-    import gc; gc.collect()
-    log_memory('model freed')
+    import gc
 
     video_name = os.path.basename(args.input_video)
     os.makedirs(args.output_dir, exist_ok=True)
-
-    processed_video_path = os.path.join(args.output_dir, os.path.splitext(video_name)[0]+'_src.mp4')
     depth_vis_path = os.path.join(args.output_dir, os.path.splitext(video_name)[0]+'_vis.mp4')
-    save_video(frames, processed_video_path, fps=fps)
-    log_memory('saved source video')
-    del frames
+
+    # Lazy reader with GPU decode (NVDEC) — decodes and scales on-the-fly, nothing stored in RAM
+    lazy_frames, target_fps = get_video_info(args.input_video, args.max_len, args.target_fps, args.max_res, device=DEVICE)
+    log_memory(f'video info read — {len(lazy_frames)} frames at {target_fps} fps (no frames decoded yet)')
+
+    # Run inference — frames decoded on-demand via NVDEC inside infer_video_depth
+    depths, fps = video_depth_anything.infer_video_depth(lazy_frames, target_fps, input_size=args.input_size, device=DEVICE, fp32=args.fp32)
+    log_memory(f'inference done — depths.shape={depths.shape}, dtype={depths.dtype}, size={depths.nbytes / (1024**3):.2f} GB')
+
+    # Free model to reclaim GPU and CPU memory before saving
+    del video_depth_anything, lazy_frames
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
     gc.collect()
+    log_memory('model freed')
+
     save_video(depths, depth_vis_path, fps=fps, is_depths=True, grayscale=args.grayscale)
     log_memory('saved depth video')
 
@@ -107,12 +107,15 @@ if __name__ == '__main__':
     if args.metric:
         import open3d as o3d
 
+        # Re-create lazy reader for frame access (GPU decode, no bulk load)
+        metric_frames, _ = get_video_info(args.input_video, args.max_len, args.target_fps, args.max_res, device=DEVICE)
         width, height = depths[0].shape[-1], depths[0].shape[-2]
         x, y = np.meshgrid(np.arange(width), np.arange(height))
         x = (x - width / 2) / args.focal_length_x
         y = (y - height / 2) / args.focal_length_y
 
-        for i, (color_image, depth) in enumerate(zip(frames, depths)):
+        for i, depth in enumerate(depths):
+            color_image = metric_frames[i]
             z = np.array(depth)
             points = np.stack((np.multiply(x, z), np.multiply(y, z), z), axis=-1).reshape(-1, 3)
             colors = np.array(color_image).reshape(-1, 3) / 255.0

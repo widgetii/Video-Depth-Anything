@@ -95,22 +95,38 @@ class VideoDepthAnything(nn.Module):
             PrepareForNet(),
         ])
 
-        frame_list = [frames[i] for i in range(frames.shape[0])]
+        # Decode frames on demand — only keep current window in memory
+        org_video_len = len(frames)  # works for ndarray, list, or LazyVideoFrames
         frame_step = INFER_LEN - OVERLAP
-        org_video_len = len(frame_list)
         append_frame_len = (frame_step - (org_video_len % frame_step)) % frame_step + (INFER_LEN - frame_step)
-        frame_list = frame_list + [frame_list[-1].copy()] * append_frame_len
-        # Release the reference to the original frames array so caller can free it
-        del frames
-        gc.collect()
-        _log_mem(f'frame_list prepared — {len(frame_list)} frames')
+        total_len = org_video_len + append_frame_len
+        
+        # Read the last frame once for padding
+        last_frame = np.array(frames[org_video_len - 1])
+        _log_mem(f'starting inference — {org_video_len} frames, window={INFER_LEN}, step={frame_step}')
+
+        # Pre-compute the transformed shape from first frame
+        first_frame = np.array(frames[0])
+        first_transformed = torch.from_numpy(transform({'image': first_frame.astype(np.float32) / 255.0})['image'])
+        transformed_shape = first_transformed.shape  # (C, H, W)
+        del first_frame, first_transformed
 
         depth_list = []
         pre_input = None
         for frame_id in tqdm(range(0, org_video_len, frame_step)):
             cur_list = []
+            # When pre_input exists, first OVERLAP slots will be overwritten — skip decoding them
+            decode_start = OVERLAP if pre_input is not None else 0
             for i in range(INFER_LEN):
-                cur_list.append(torch.from_numpy(transform({'image': frame_list[frame_id+i].astype(np.float32) / 255.0})['image']).unsqueeze(0).unsqueeze(0))
+                if i < decode_start:
+                    cur_list.append(torch.zeros(1, 1, *transformed_shape))
+                else:
+                    abs_idx = frame_id + i
+                    if abs_idx < org_video_len:
+                        raw_frame = np.array(frames[abs_idx])
+                    else:
+                        raw_frame = last_frame.copy()
+                    cur_list.append(torch.from_numpy(transform({'image': raw_frame.astype(np.float32) / 255.0})['image']).unsqueeze(0).unsqueeze(0))
             cur_input = torch.cat(cur_list, dim=1).to(device)
             if pre_input is not None:
                 cur_input[:, :OVERLAP, ...] = pre_input[:, KEYFRAMES, ...]
@@ -124,13 +140,13 @@ class VideoDepthAnything(nn.Module):
             depth_list += [depth[i][0].cpu().numpy().astype(np.float16) for i in range(depth.shape[0])]
 
             pre_input = cur_input
+
             if frame_id % (frame_step * 10) == 0:
                 _log_mem(f'inference loop frame_id={frame_id}/{org_video_len}')
 
         _log_mem(f'inference loop done — {len(depth_list)} depth maps')
-        del frame_list
+        del last_frame
         gc.collect()
-        _log_mem('after gc.collect (frame_list deleted)')
 
         depth_list_aligned = []
         ref_align = []
