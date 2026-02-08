@@ -14,10 +14,19 @@
 import argparse
 import numpy as np
 import os
+import sys
 import torch
+import psutil
 
 from video_depth_anything.video_depth import VideoDepthAnything
 from utils.dc_utils import read_video_frames, save_video
+
+def log_memory(stage: str):
+    proc = psutil.Process(os.getpid())
+    mem = proc.memory_info()
+    rss_gb = mem.rss / (1024 ** 3)
+    vms_gb = mem.vms / (1024 ** 3)
+    print(f"[MEM] {stage}: RSS={rss_gb:.2f} GB, VMS={vms_gb:.2f} GB", flush=True)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Video Depth Anything')
@@ -52,9 +61,18 @@ if __name__ == '__main__':
     video_depth_anything = VideoDepthAnything(**model_configs[args.encoder], metric=args.metric)
     video_depth_anything.load_state_dict(torch.load(f'./checkpoints/{checkpoint_name}_{args.encoder}.pth', map_location='cpu'), strict=True)
     video_depth_anything = video_depth_anything.to(DEVICE).eval()
+    log_memory('model loaded')
 
     frames, target_fps = read_video_frames(args.input_video, args.max_len, args.target_fps, args.max_res)
+    log_memory(f'video decoded — frames.shape={frames.shape}, dtype={frames.dtype}, size={frames.nbytes / (1024**3):.2f} GB')
     depths, fps = video_depth_anything.infer_video_depth(frames, target_fps, input_size=args.input_size, device=DEVICE, fp32=args.fp32)
+    log_memory(f'inference done — depths.shape={depths.shape}, dtype={depths.dtype}, size={depths.nbytes / (1024**3):.2f} GB')
+
+    # Free model to reclaim GPU and CPU memory before saving
+    del video_depth_anything
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    import gc; gc.collect()
+    log_memory('model freed')
 
     video_name = os.path.basename(args.input_video)
     os.makedirs(args.output_dir, exist_ok=True)
@@ -62,7 +80,11 @@ if __name__ == '__main__':
     processed_video_path = os.path.join(args.output_dir, os.path.splitext(video_name)[0]+'_src.mp4')
     depth_vis_path = os.path.join(args.output_dir, os.path.splitext(video_name)[0]+'_vis.mp4')
     save_video(frames, processed_video_path, fps=fps)
+    log_memory('saved source video')
+    del frames
+    gc.collect()
     save_video(depths, depth_vis_path, fps=fps, is_depths=True, grayscale=args.grayscale)
+    log_memory('saved depth video')
 
     if args.save_npz:
         depth_npz_path = os.path.join(args.output_dir, os.path.splitext(video_name)[0]+'_depths.npz')
@@ -79,7 +101,7 @@ if __name__ == '__main__':
                 "Z": Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT))
             }
             exr_file = OpenEXR.OutputFile(output_exr, header)
-            exr_file.writePixels({"Z": depth.tobytes()})
+            exr_file.writePixels({"Z": depth.astype(np.float32).tobytes()})
             exr_file.close()
 
     if args.metric:

@@ -19,6 +19,13 @@ import cv2
 from tqdm import tqdm
 import numpy as np
 import gc
+import os
+import psutil
+
+def _log_mem(stage: str):
+    proc = psutil.Process(os.getpid())
+    rss_gb = proc.memory_info().rss / (1024 ** 3)
+    print(f"[MEM][infer] {stage}: RSS={rss_gb:.2f} GB", flush=True)
 
 from .dinov2 import DINOv2
 from .dpt_temporal import DPTHeadTemporal
@@ -93,6 +100,10 @@ class VideoDepthAnything(nn.Module):
         org_video_len = len(frame_list)
         append_frame_len = (frame_step - (org_video_len % frame_step)) % frame_step + (INFER_LEN - frame_step)
         frame_list = frame_list + [frame_list[-1].copy()] * append_frame_len
+        # Release the reference to the original frames array so caller can free it
+        del frames
+        gc.collect()
+        _log_mem(f'frame_list prepared — {len(frame_list)} frames')
 
         depth_list = []
         pre_input = None
@@ -110,12 +121,16 @@ class VideoDepthAnything(nn.Module):
 
             depth = depth.to(cur_input.dtype)
             depth = F.interpolate(depth.flatten(0,1).unsqueeze(1), size=(frame_height, frame_width), mode='bilinear', align_corners=True)
-            depth_list += [depth[i][0].cpu().numpy() for i in range(depth.shape[0])]
+            depth_list += [depth[i][0].cpu().numpy().astype(np.float16) for i in range(depth.shape[0])]
 
             pre_input = cur_input
+            if frame_id % (frame_step * 10) == 0:
+                _log_mem(f'inference loop frame_id={frame_id}/{org_video_len}')
 
+        _log_mem(f'inference loop done — {len(depth_list)} depth maps')
         del frame_list
         gc.collect()
+        _log_mem('after gc.collect (frame_list deleted)')
 
         depth_list_aligned = []
         ref_align = []
@@ -126,11 +141,11 @@ class VideoDepthAnything(nn.Module):
             if len(depth_list_aligned) == 0:
                 depth_list_aligned += depth_list[:INFER_LEN]
                 for kf_id in kf_align_list:
-                    ref_align.append(depth_list[frame_id+kf_id])
+                    ref_align.append(depth_list[frame_id+kf_id].astype(np.float32))
             else:
                 curr_align = []
                 for i in range(len(kf_align_list)):
-                    curr_align.append(depth_list[frame_id+i])
+                    curr_align.append(depth_list[frame_id+i].astype(np.float32))
 
                 if self.metric:
                     scale, shift = 1.0, 0.0
@@ -139,25 +154,36 @@ class VideoDepthAnything(nn.Module):
                                                            np.concatenate(ref_align),
                                                            np.concatenate(np.ones_like(ref_align)==1))
 
-                pre_depth_list = depth_list_aligned[-INTERP_LEN:]
-                post_depth_list = depth_list[frame_id+align_len:frame_id+OVERLAP]
+                pre_depth_list = [d.astype(np.float32) for d in depth_list_aligned[-INTERP_LEN:]]
+                post_depth_list = [d.astype(np.float32) for d in depth_list[frame_id+align_len:frame_id+OVERLAP]]
                 for i in range(len(post_depth_list)):
                     post_depth_list[i] = post_depth_list[i] * scale + shift
                     post_depth_list[i][post_depth_list[i]<0] = 0
-                depth_list_aligned[-INTERP_LEN:] = get_interpolate_frames(pre_depth_list, post_depth_list)
+                interp_result = get_interpolate_frames(pre_depth_list, post_depth_list)
+                depth_list_aligned[-INTERP_LEN:] = [d.astype(np.float16) for d in interp_result]
 
                 for i in range(OVERLAP, INFER_LEN):
-                    new_depth = depth_list[frame_id+i] * scale + shift
+                    new_depth = depth_list[frame_id+i].astype(np.float32) * scale + shift
                     new_depth[new_depth<0] = 0
-                    depth_list_aligned.append(new_depth)
+                    depth_list_aligned.append(new_depth.astype(np.float16))
 
                 ref_align = ref_align[:1]
                 for kf_id in kf_align_list[1:]:
-                    new_depth = depth_list[frame_id+kf_id] * scale + shift
+                    new_depth = depth_list[frame_id+kf_id].astype(np.float32) * scale + shift
                     new_depth[new_depth<0] = 0
                     ref_align.append(new_depth)
 
-        depth_list = depth_list_aligned
+            # Free processed chunk from depth_list to reduce peak memory
+            for i in range(INFER_LEN):
+                depth_list[frame_id + i] = None
 
-        return np.stack(depth_list[:org_video_len], axis=0), target_fps
+        del depth_list
+        gc.collect()
+        _log_mem(f'alignment done — {len(depth_list_aligned)} aligned depth maps')
+
+        result = np.stack(depth_list_aligned[:org_video_len], axis=0)
+        del depth_list_aligned
+        gc.collect()
+        _log_mem(f'np.stack done — result size={result.nbytes / (1024**3):.2f} GB')
+        return result, target_fps
 

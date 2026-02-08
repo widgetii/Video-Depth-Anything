@@ -16,7 +16,7 @@ except:
 def ensure_even(value):
     return value if value % 2 == 0 else value + 1
 
-def read_video_frames(video_path, process_length, target_fps=-1, max_res=-1):
+def read_video_frames(video_path, process_length, target_fps=-1, max_res=-1, max_batch_size=64):
     if DECORD_AVAILABLE:
         vid = VideoReader(video_path, ctx=cpu(0))
         original_height, original_width = vid.get_batch([0]).shape[1:3]
@@ -35,7 +35,13 @@ def read_video_frames(video_path, process_length, target_fps=-1, max_res=-1):
         frames_idx = list(range(0, len(vid), stride))
         if process_length != -1 and process_length < len(frames_idx):
             frames_idx = frames_idx[:process_length]
-        frames = vid.get_batch(frames_idx).asnumpy()
+        # Load in batches to avoid OOM instead of one giant get_batch call
+        frames_list = []
+        for i in range(0, len(frames_idx), max_batch_size):
+            batch_idx = frames_idx[i : i + max_batch_size]
+            batch = vid.get_batch(batch_idx).asnumpy()
+            frames_list.append(batch)
+        frames = np.concatenate(frames_list, axis=0)
     else:
         cap = cv2.VideoCapture(video_path)
         original_fps = cap.get(cv2.CAP_PROP_FPS)
@@ -53,15 +59,19 @@ def read_video_frames(video_path, process_length, target_fps=-1, max_res=-1):
 
         frames = []
         frame_count = 0
+        selected_count = 0
         while cap.isOpened():
             ret, frame = cap.read()
-            if not ret or (process_length > 0 and frame_count >= process_length):
+            if not ret:
                 break
             if frame_count % stride == 0:
+                if process_length > 0 and selected_count >= process_length:
+                    break
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # Convert BGR to RGB
                 if max_res > 0 and max(original_height, original_width) > max_res:
                     frame = cv2.resize(frame, (width, height))  # Resize frame
                 frames.append(frame)
+                selected_count += 1
             frame_count += 1
         cap.release()
         frames = np.stack(frames, axis=0)
