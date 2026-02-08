@@ -169,7 +169,7 @@ name = "decord"
 version = "0.6.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "numpy" },
+    { name = "numpy", marker = "sys_platform != 'darwin'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/11/79/936af42edf90a7bd4e41a6cac89c913d4b47fa48a26b042d5129a9242ee3/decord-0.6.0-py3-none-manylinux2010_x86_64.whl", hash = "sha256:51997f20be8958e23b7c4061ba45d0efcd86bffd5fe81c695d0befee0d442976", size = 13602299, upload-time = "2021-06-14T21:30:55.486Z" },
@@ -192,6 +192,17 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/ff/e9/9ba84945717efa970463e0404013624485a58b1e14a38b7aff9402f18c14/einops-0.4.1.tar.gz", hash = "sha256:65ede824fa54ce99ba969c61152f9948eb8cad08d5f0ca97c95e3804bafcce48", size = 27591, upload-time = "2022-03-04T09:32:09.703Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/df/bf/18c6c753fe699c44e3d6013d75074e15f139f9a9adbaeb108f61d73d18d1/einops-0.4.1-py3-none-any.whl", hash = "sha256:932b12bb3176caef629cc513fc8a442338fdbfe1e560794a6e7306dcee65a8af", size = 28197, upload-time = "2022-03-04T09:32:08.413Z" },
+]
+
+[[package]]
+name = "eva-decord"
+version = "0.6.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", marker = "sys_platform == 'darwin'" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4d/0e/7f0de86f57de0e30e94989548943de8789b7315fa7d14c3d31a8291cc018/eva_decord-0.6.1-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:ae41d7958b7d6fc3af66ae1b4072d6f938abe04f2016b56891688ac8a78ee158", size = 12940400, upload-time = "2023-04-20T05:52:44.691Z" },
 ]
 
 [[package]]
@@ -988,9 +999,10 @@ name = "video-depth-anything"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
-    { name = "decord" },
+    { name = "decord", marker = "sys_platform != 'darwin'" },
     { name = "easydict" },
     { name = "einops" },
+    { name = "eva-decord", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
     { name = "imageio" },
     { name = "imageio-ffmpeg" },
     { name = "matplotlib" },
@@ -1002,14 +1014,15 @@ dependencies = [
     { name = "torch" },
     { name = "torchvision" },
     { name = "tqdm" },
-    { name = "xformers" },
+    { name = "xformers", marker = "sys_platform == 'linux'" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "decord", specifier = ">=0.6.0" },
+    { name = "decord", marker = "sys_platform != 'darwin'", specifier = "==0.6.0" },
     { name = "easydict", specifier = ">=1.13" },
     { name = "einops", specifier = "==0.4.1" },
+    { name = "eva-decord", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = "==0.6.1" },
     { name = "imageio", specifier = "==2.37.0" },
     { name = "imageio-ffmpeg", specifier = "==0.4.7" },
     { name = "matplotlib", specifier = ">=3.10.8" },
@@ -1020,7 +1033,7 @@ requires-dist = [
     { name = "torch", specifier = "==2.1.1" },
     { name = "torchvision", specifier = "==0.16.1" },
     { name = "tqdm", specifier = ">=4.67.3" },
-    { name = "xformers", specifier = "==0.0.23" },
+    { name = "xformers", marker = "sys_platform == 'linux'", specifier = "==0.0.23" },
 ]
 
 [[package]]
@@ -1028,11 +1041,10 @@ name = "xformers"
 version = "0.0.23"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "numpy" },
-    { name = "torch" },
+    { name = "numpy", marker = "sys_platform != 'darwin'" },
+    { name = "torch", marker = "sys_platform != 'darwin'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/66/fe/0954087306dcbc8cbffb6141748b3f1e4c6fd2203386783ee8d61cf995bb/xformers-0.0.23.tar.gz", hash = "sha256:9dbc9a4a2a426e6e006417e762c54e3eb32265dde1091419d13fa683ab70559b", size = 3847346, upload-time = "2023-12-06T18:00:35.199Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/10/e7/5a4a46e5e9ea52dfe92bfe816546700d759ffe61e29b62c875465ae82861/xformers-0.0.23-cp311-cp311-manylinux2014_x86_64.whl", hash = "sha256:8c3463def8f115239b60114693a54d50a8f78a09f475428ea22d034bf3587985", size = 213013346, upload-time = "2023-12-06T17:59:34.795Z" },
-    { url = "https://files.pythonhosted.org/packages/bc/c3/945ccb420bc48f0975586c9a42649759a56b67b0ae55af08d0d3389455d0/xformers-0.0.23-cp311-cp311-win_amd64.whl", hash = "sha256:32203f4450470f5f16e719dac542f6b665f7111105dd543badf4ae5492de415e", size = 201123521, upload-time = "2023-12-06T17:59:45.188Z" },
 ]

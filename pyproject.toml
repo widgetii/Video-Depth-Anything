@@ -5,7 +5,8 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "decord>=0.6.0",
+    "decord==0.6.0; sys_platform != 'darwin'",
+    "eva-decord==0.6.1; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "easydict>=1.13",
     "einops==0.4.1",
     "imageio==2.37.0",
@@ -18,5 +19,5 @@ dependencies = [
     "torch==2.1.1",
     "torchvision==0.16.1",
     "tqdm>=4.67.3",
-    "xformers==0.0.23",
+    "xformers==0.0.23; sys_platform == 'linux'",
 ]
