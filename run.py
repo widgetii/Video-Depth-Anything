@@ -73,54 +73,111 @@ if __name__ == '__main__':
     lazy_frames, target_fps = get_video_info(args.input_video, args.max_len, args.target_fps, args.max_res, device=DEVICE)
     log_memory(f'video info read — {len(lazy_frames)} frames at {target_fps} fps (no frames decoded yet)')
 
-    # Run inference — frames decoded on-demand via NVDEC inside infer_video_depth
-    depths, fps = video_depth_anything.infer_video_depth(lazy_frames, target_fps, input_size=args.input_size, device=DEVICE, fp32=args.fp32)
-    log_memory(f'inference done — depths.shape={depths.shape}, dtype={depths.dtype}, size={depths.nbytes / (1024**3):.2f} GB')
+    # Set up streaming output writers
+    import imageio
+    import matplotlib.cm as cm
 
-    # Free model to reclaim GPU and CPU memory before saving
+    vis_writer = imageio.get_writer(depth_vis_path, fps=target_fps, macro_block_size=1,
+                                     codec='libx264', ffmpeg_params=['-crf', '18'])
+
+    exr_dir = None
+    if args.save_exr:
+        exr_dir = os.path.join(args.output_dir, os.path.splitext(video_name)[0]+'_depths_exr')
+        os.makedirs(exr_dir, exist_ok=True)
+        import OpenEXR
+        import Imath
+
+    npz_dir = None
+    if args.save_npz:
+        npz_dir = os.path.join(args.output_dir, os.path.splitext(video_name)[0]+'_depths_npy')
+        os.makedirs(npz_dir, exist_ok=True)
+
+    # Streaming inference + alignment — yields finalized depth frames one at a time
+    # First pass: collect global min/max for visualization normalization
+    # Since we're streaming, we track min/max incrementally and write raw depths to temp npy files,
+    # then do a quick second pass for visualization.
+    # Actually, for efficiency: write EXR/NPZ immediately, buffer only the vis pass.
+    # But that still requires all depths in memory for vis. Instead, use per-frame normalization
+    # or accept slight quality difference with incremental min/max.
+    #
+    # Best approach: write raw outputs (EXR, NPZ) immediately. For vis video, use per-frame
+    # normalization which is actually more useful for most use cases.
+
+    colormap = np.array(cm.get_cmap("inferno").colors)
+    frame_idx = 0
+    depth_global_min = float('inf')
+    depth_global_max = float('-inf')
+
+    for depth_frame in video_depth_anything.infer_video_depth(lazy_frames, target_fps,
+                                                               input_size=args.input_size,
+                                                               device=DEVICE, fp32=args.fp32):
+        # Track global stats
+        d_min = float(depth_frame.min())
+        d_max = float(depth_frame.max())
+        depth_global_min = min(depth_global_min, d_min)
+        depth_global_max = max(depth_global_max, d_max)
+
+        # Write depth visualization (per-frame normalization for streaming)
+        if d_max > d_min:
+            depth_norm = ((depth_frame.astype(np.float32) - d_min) / (d_max - d_min) * 255).astype(np.uint8)
+        else:
+            depth_norm = np.zeros_like(depth_frame, dtype=np.uint8)
+        if not args.grayscale:
+            depth_vis = (colormap[depth_norm] * 255).astype(np.uint8)
+        else:
+            depth_vis = depth_norm
+        vis_writer.append_data(depth_vis)
+
+        # Write EXR immediately
+        if exr_dir is not None:
+            output_exr = f"{exr_dir}/frame_{frame_idx:05d}.exr"
+            header = OpenEXR.Header(depth_frame.shape[1], depth_frame.shape[0])
+            header["channels"] = {
+                "Z": Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT))
+            }
+            exr_file = OpenEXR.OutputFile(output_exr, header)
+            exr_file.writePixels({"Z": depth_frame.astype(np.float32).tobytes()})
+            exr_file.close()
+
+        # Write individual npy frame
+        if npz_dir is not None:
+            np.save(f"{npz_dir}/frame_{frame_idx:05d}.npy", depth_frame)
+
+        frame_idx += 1
+        if frame_idx % 500 == 0:
+            log_memory(f'streamed {frame_idx} frames')
+
+    vis_writer.close()
+    log_memory(f'streaming done — {frame_idx} depth frames written')
+    print(f"[INFO] Depth range: min={depth_global_min:.4f}, max={depth_global_max:.4f}", flush=True)
+
+    # Free model and reader
     del video_depth_anything, lazy_frames
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
     gc.collect()
     log_memory('model freed')
 
-    save_video(depths, depth_vis_path, fps=fps, is_depths=True, grayscale=args.grayscale)
-    log_memory('saved depth video')
-
-    if args.save_npz:
-        depth_npz_path = os.path.join(args.output_dir, os.path.splitext(video_name)[0]+'_depths.npz')
-        np.savez_compressed(depth_npz_path, depths=depths)
-    if args.save_exr:
-        depth_exr_dir = os.path.join(args.output_dir, os.path.splitext(video_name)[0]+'_depths_exr')
-        os.makedirs(depth_exr_dir, exist_ok=True)
-        import OpenEXR
-        import Imath
-        for i, depth in enumerate(depths):
-            output_exr = f"{depth_exr_dir}/frame_{i:05d}.exr"
-            header = OpenEXR.Header(depth.shape[1], depth.shape[0])
-            header["channels"] = {
-                "Z": Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT))
-            }
-            exr_file = OpenEXR.OutputFile(output_exr, header)
-            exr_file.writePixels({"Z": depth.astype(np.float32).tobytes()})
-            exr_file.close()
-
     if args.metric:
         import open3d as o3d
 
-        # Re-create lazy reader for frame access (GPU decode, no bulk load)
         metric_frames, _ = get_video_info(args.input_video, args.max_len, args.target_fps, args.max_res, device=DEVICE)
-        width, height = depths[0].shape[-1], depths[0].shape[-2]
-        x, y = np.meshgrid(np.arange(width), np.arange(height))
-        x = (x - width / 2) / args.focal_length_x
-        y = (y - height / 2) / args.focal_length_y
-
-        for i, depth in enumerate(depths):
-            color_image = metric_frames[i]
-            z = np.array(depth)
-            points = np.stack((np.multiply(x, z), np.multiply(y, z), z), axis=-1).reshape(-1, 3)
-            colors = np.array(color_image).reshape(-1, 3) / 255.0
-
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(points)
-            pcd.colors = o3d.utility.Vector3dVector(colors)
-            o3d.io.write_point_cloud(os.path.join(args.output_dir, 'point' + str(i).zfill(4) + '.ply'), pcd)
+        # Load depth frames from saved npy files if available, otherwise warn
+        if npz_dir is not None:
+            width, height = None, None
+            for i in range(frame_idx):
+                depth = np.load(f"{npz_dir}/frame_{i:05d}.npy")
+                if width is None:
+                    width, height = depth.shape[-1], depth.shape[-2]
+                    x, y = np.meshgrid(np.arange(width), np.arange(height))
+                    x = (x - width / 2) / args.focal_length_x
+                    y = (y - height / 2) / args.focal_length_y
+                color_image = metric_frames[i]
+                z = depth.astype(np.float32)
+                points = np.stack((np.multiply(x, z), np.multiply(y, z), z), axis=-1).reshape(-1, 3)
+                colors = np.array(color_image).reshape(-1, 3) / 255.0
+                pcd = o3d.geometry.PointCloud()
+                pcd.points = o3d.utility.Vector3dVector(points)
+                pcd.colors = o3d.utility.Vector3dVector(colors)
+                o3d.io.write_point_cloud(os.path.join(args.output_dir, 'point' + str(i).zfill(4) + '.ply'), pcd)
+        else:
+            print("[WARN] --metric requires depth data. Use --save_npz or --save_exr to enable point cloud export.", flush=True)

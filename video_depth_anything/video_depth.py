@@ -75,9 +75,15 @@ class VideoDepthAnything(nn.Module):
         return depth.squeeze(1).unflatten(0, (B, T)) # return shape [B, T, H, W]
 
     def infer_video_depth(self, frames, target_fps, input_size=518, device='cuda', fp32=False):
+        """Streaming inference: yields batches of finalized aligned depth frames (float16).
+        
+        Each yield is a list of numpy arrays (H, W) in float16.
+        Frames are yielded as soon as they are finalized (will not change).
+        Memory usage stays nearly constant regardless of video length.
+        """
         frame_height, frame_width = frames[0].shape[:2]
         ratio = max(frame_height, frame_width) / min(frame_height, frame_width)
-        if ratio > 1.78:  # we recommend to process video with ratio smaller than 16:9 due to memory limitation
+        if ratio > 1.78:
             input_size = int(input_size * 1.777 / ratio)
             input_size = round(input_size / 14) * 14
 
@@ -95,27 +101,32 @@ class VideoDepthAnything(nn.Module):
             PrepareForNet(),
         ])
 
-        # Decode frames on demand — only keep current window in memory
-        org_video_len = len(frames)  # works for ndarray, list, or LazyVideoFrames
+        org_video_len = len(frames)
         frame_step = INFER_LEN - OVERLAP
-        append_frame_len = (frame_step - (org_video_len % frame_step)) % frame_step + (INFER_LEN - frame_step)
-        total_len = org_video_len + append_frame_len
-        
-        # Read the last frame once for padding
-        last_frame = np.array(frames[org_video_len - 1])
-        _log_mem(f'starting inference — {org_video_len} frames, window={INFER_LEN}, step={frame_step}')
+        align_len = OVERLAP - INTERP_LEN
+        kf_align_list = KEYFRAMES[:align_len]
 
-        # Pre-compute the transformed shape from first frame
+        # Read last frame once for padding
+        last_frame = np.array(frames[org_video_len - 1])
+
+        # Pre-compute transformed shape from first frame
         first_frame = np.array(frames[0])
         first_transformed = torch.from_numpy(transform({'image': first_frame.astype(np.float32) / 255.0})['image'])
-        transformed_shape = first_transformed.shape  # (C, H, W)
+        transformed_shape = first_transformed.shape
         del first_frame, first_transformed
 
-        depth_list = []
+        _log_mem(f'starting streaming inference — {org_video_len} frames, window={INFER_LEN}, step={frame_step}')
+
+        # Aligned buffer: only holds frames that might still be modified (up to INTERP_LEN)
+        aligned_tail = []  # last INTERP_LEN frames that may be modified by next chunk
+        ref_align = []
         pre_input = None
+        total_yielded = 0
+        chunk_idx = 0
+
         for frame_id in tqdm(range(0, org_video_len, frame_step)):
+            # --- INFERENCE for this chunk ---
             cur_list = []
-            # When pre_input exists, first OVERLAP slots will be overwritten — skip decoding them
             decode_start = OVERLAP if pre_input is not None else 0
             for i in range(INFER_LEN):
                 if i < decode_start:
@@ -126,80 +137,90 @@ class VideoDepthAnything(nn.Module):
                         raw_frame = np.array(frames[abs_idx])
                     else:
                         raw_frame = last_frame.copy()
-                    cur_list.append(torch.from_numpy(transform({'image': raw_frame.astype(np.float32) / 255.0})['image']).unsqueeze(0).unsqueeze(0))
+                    cur_list.append(torch.from_numpy(
+                        transform({'image': raw_frame.astype(np.float32) / 255.0})['image']
+                    ).unsqueeze(0).unsqueeze(0))
+
             cur_input = torch.cat(cur_list, dim=1).to(device)
             if pre_input is not None:
                 cur_input[:, :OVERLAP, ...] = pre_input[:, KEYFRAMES, ...]
 
             with torch.no_grad():
                 with torch.autocast(device_type=device, enabled=(not fp32)):
-                    depth = self.forward(cur_input) # depth shape: [1, T, H, W]
+                    depth = self.forward(cur_input)
 
             depth = depth.to(cur_input.dtype)
-            depth = F.interpolate(depth.flatten(0,1).unsqueeze(1), size=(frame_height, frame_width), mode='bilinear', align_corners=True)
-            depth_list += [depth[i][0].cpu().numpy().astype(np.float16) for i in range(depth.shape[0])]
-
+            depth = F.interpolate(depth.flatten(0, 1).unsqueeze(1),
+                                  size=(frame_height, frame_width), mode='bilinear', align_corners=True)
+            chunk_depths = [depth[i][0].cpu().numpy().astype(np.float16) for i in range(depth.shape[0])]
             pre_input = cur_input
 
-            if frame_id % (frame_step * 10) == 0:
-                _log_mem(f'inference loop frame_id={frame_id}/{org_video_len}')
-
-        _log_mem(f'inference loop done — {len(depth_list)} depth maps')
-        del last_frame
-        gc.collect()
-
-        depth_list_aligned = []
-        ref_align = []
-        align_len = OVERLAP - INTERP_LEN
-        kf_align_list = KEYFRAMES[:align_len]
-
-        for frame_id in range(0, len(depth_list), INFER_LEN):
-            if len(depth_list_aligned) == 0:
-                depth_list_aligned += depth_list[:INFER_LEN]
-                for kf_id in kf_align_list:
-                    ref_align.append(depth_list[frame_id+kf_id].astype(np.float32))
+            # --- ALIGNMENT for this chunk ---
+            if chunk_idx == 0:
+                # First chunk: no alignment needed
+                ref_align = [chunk_depths[kf_id].astype(np.float32) for kf_id in kf_align_list]
+                # Yield everything except the last INTERP_LEN (those may be modified)
+                finalized = chunk_depths[:INFER_LEN - INTERP_LEN]
+                aligned_tail = chunk_depths[INFER_LEN - INTERP_LEN:INFER_LEN]
             else:
-                curr_align = []
-                for i in range(len(kf_align_list)):
-                    curr_align.append(depth_list[frame_id+i].astype(np.float32))
-
+                # Compute scale and shift
+                curr_align = [chunk_depths[i].astype(np.float32) for i in range(len(kf_align_list))]
                 if self.metric:
                     scale, shift = 1.0, 0.0
                 else:
-                    scale, shift = compute_scale_and_shift(np.concatenate(curr_align),
-                                                           np.concatenate(ref_align),
-                                                           np.concatenate(np.ones_like(ref_align)==1))
+                    scale, shift = compute_scale_and_shift(
+                        np.concatenate(curr_align),
+                        np.concatenate(ref_align),
+                        np.concatenate(np.ones_like(ref_align) == 1))
 
-                pre_depth_list = [d.astype(np.float32) for d in depth_list_aligned[-INTERP_LEN:]]
-                post_depth_list = [d.astype(np.float32) for d in depth_list[frame_id+align_len:frame_id+OVERLAP]]
+                # Interpolate overlap zone
+                pre_depth_list = [d.astype(np.float32) for d in aligned_tail]
+                post_depth_list = [chunk_depths[align_len + i].astype(np.float32) for i in range(INTERP_LEN)]
                 for i in range(len(post_depth_list)):
                     post_depth_list[i] = post_depth_list[i] * scale + shift
-                    post_depth_list[i][post_depth_list[i]<0] = 0
+                    post_depth_list[i][post_depth_list[i] < 0] = 0
                 interp_result = get_interpolate_frames(pre_depth_list, post_depth_list)
-                depth_list_aligned[-INTERP_LEN:] = [d.astype(np.float16) for d in interp_result]
+                interpolated = [d.astype(np.float16) for d in interp_result]
 
+                # Apply scale+shift to remaining frames
+                new_frames = []
                 for i in range(OVERLAP, INFER_LEN):
-                    new_depth = depth_list[frame_id+i].astype(np.float32) * scale + shift
-                    new_depth[new_depth<0] = 0
-                    depth_list_aligned.append(new_depth.astype(np.float16))
+                    d = chunk_depths[i].astype(np.float32) * scale + shift
+                    d[d < 0] = 0
+                    new_frames.append(d.astype(np.float16))
 
+                # All frames in this chunk's output: interpolated + new_frames
+                all_new = interpolated + new_frames
+                # Finalized = everything except last INTERP_LEN
+                finalized = all_new[:len(all_new) - INTERP_LEN]
+                aligned_tail = all_new[len(all_new) - INTERP_LEN:]
+
+                # Update ref_align
                 ref_align = ref_align[:1]
                 for kf_id in kf_align_list[1:]:
-                    new_depth = depth_list[frame_id+kf_id].astype(np.float32) * scale + shift
-                    new_depth[new_depth<0] = 0
-                    ref_align.append(new_depth)
+                    d = chunk_depths[kf_id].astype(np.float32) * scale + shift
+                    d[d < 0] = 0
+                    ref_align.append(d)
 
-            # Free processed chunk from depth_list to reduce peak memory
-            for i in range(INFER_LEN):
-                depth_list[frame_id + i] = None
+            # --- YIELD finalized frames ---
+            # Don't yield more than org_video_len total
+            for f in finalized:
+                if total_yielded < org_video_len:
+                    yield f
+                    total_yielded += 1
 
-        del depth_list
+            chunk_idx += 1
+
+            if frame_id % (frame_step * 10) == 0:
+                _log_mem(f'streaming frame_id={frame_id}/{org_video_len}, yielded={total_yielded}')
+
+        # Flush remaining tail frames
+        for f in aligned_tail:
+            if total_yielded < org_video_len:
+                yield f
+                total_yielded += 1
+
+        del last_frame
         gc.collect()
-        _log_mem(f'alignment done — {len(depth_list_aligned)} aligned depth maps')
-
-        result = np.stack(depth_list_aligned[:org_video_len], axis=0)
-        del depth_list_aligned
-        gc.collect()
-        _log_mem(f'np.stack done — result size={result.nbytes / (1024**3):.2f} GB')
-        return result, target_fps
+        _log_mem(f'streaming done — yielded {total_yielded} frames total')
 
